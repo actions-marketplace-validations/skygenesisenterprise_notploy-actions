@@ -1,10 +1,20 @@
 // Package notploy is a small, dependency-free HTTP client for the Notploy REST
 // API.
 //
-// Notploy exposes its tRPC routers over HTTP as `POST|GET /api/<router>.<procedure>`
-// and authenticates with an `x-api-key` header. The OpenAPI document declares
-// most responses as empty objects, so only the fields the action actually needs
-// are modelled here — deliberately not a copy of the TypeScript schemas.
+// Two API surfaces are modelled here:
+//
+//   - the CI/CD API (`POST /api/cicd/deploy`, `GET /api/cicd/deployments/{id}`),
+//     which returns the id of the deployment it created, accepts the CI run
+//     metadata and is idempotent — the action's preferred contract;
+//   - the classic endpoints (`POST /api/application.deploy`,
+//     `GET /api/deployment.all`), which the action keeps using when the API key
+//     is not a CI/CD token.
+//
+// Notploy exposes its tRPC routers over HTTP as `POST|GET /api/<operation>` (or
+// through the CI/CD router's own paths) and authenticates with an `x-api-key`
+// header. The OpenAPI document declares most response bodies as empty objects,
+// so only the fields the action actually needs are modelled here — deliberately
+// not a copy of the TypeScript schemas.
 //
 // This package knows nothing about GitHub Actions.
 package notploy
@@ -12,13 +22,18 @@ package notploy
 import "strings"
 
 // Deployment statuses, mirroring the `deploymentStatus` enum of the Notploy
-// database schema. There is no separate `queued` state: a deployment row is
-// created with the status `running`.
+// database schema.
 const (
 	StatusRunning   = "running"
 	StatusDone      = "done"
 	StatusError     = "error"
 	StatusCancelled = "cancelled"
+	// StatusQueued does not exist in the database: a deployment row is created
+	// with the status `running`. The CI/CD API reports the derived state
+	// `queued` while no worker has picked the job up yet, and the action
+	// surfaces it so a workflow can tell "waiting for a worker" from
+	// "building".
+	StatusQueued = "queued"
 )
 
 // Deployment is one deployment record, as returned by `deployment.all`.

@@ -2,6 +2,7 @@ package github
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -20,6 +21,7 @@ type Context struct {
 	EventName  string
 	RunID      string
 	RunNumber  string
+	RunAttempt string
 	ServerURL  string
 	Workflow   string
 }
@@ -35,6 +37,7 @@ func LoadContext(getenv Getenv) Context {
 		EventName:  getenv("GITHUB_EVENT_NAME"),
 		RunID:      getenv("GITHUB_RUN_ID"),
 		RunNumber:  getenv("GITHUB_RUN_NUMBER"),
+		RunAttempt: getenv("GITHUB_RUN_ATTEMPT"),
 		ServerURL:  getenv("GITHUB_SERVER_URL"),
 		Workflow:   getenv("GITHUB_WORKFLOW"),
 	}
@@ -60,6 +63,47 @@ func (c Context) CommitURL() string {
 		c.Repository,
 		c.Sha,
 	)
+}
+
+// RunURL returns a link to the workflow run, or "" when the action runs
+// outside of GitHub Actions.
+func (c Context) RunURL() string {
+	if c.ServerURL == "" || c.Repository == "" || c.RunID == "" {
+		return ""
+	}
+	return fmt.Sprintf(
+		"%s/%s/actions/runs/%s",
+		strings.TrimRight(c.ServerURL, "/"),
+		c.Repository,
+		c.RunID,
+	)
+}
+
+// RunNumberValue parses the run number, defaulting to 0 when it is absent or
+// not a number (which is the case outside of GitHub Actions).
+func (c Context) RunNumberValue() int {
+	value, err := strconv.Atoi(strings.TrimSpace(c.RunNumber))
+	if err != nil || value < 0 {
+		return 0
+	}
+	return value
+}
+
+// DefaultIdempotencyKey derives the key that makes one workflow attempt equal
+// one deployment: a retried HTTP request replays the same deployment, while a
+// re-run of the job (a new attempt) deploys again.
+//
+// It is empty outside of GitHub Actions, where there is no run to key on; the
+// caller then sends no key and stops retrying the trigger.
+func (c Context) DefaultIdempotencyKey() string {
+	if c.RunID == "" {
+		return ""
+	}
+	attempt := strings.TrimSpace(c.RunAttempt)
+	if attempt == "" {
+		attempt = "1"
+	}
+	return fmt.Sprintf("gha-%s-%s", c.RunID, attempt)
 }
 
 // Revision describes the commit under test as `owner/repository@abc1234`.

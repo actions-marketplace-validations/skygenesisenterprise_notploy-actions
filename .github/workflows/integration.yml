@@ -1,0 +1,106 @@
+name: Integration
+
+# Runs the action from this checkout against a real Notploy instance. It is
+# manual on purpose: it deploys something, so a human decides when.
+#
+# Requirements:
+#   - repository secret NOTPLOY_API_KEY holding a Notploy API key (a CI/CD
+#     token is required for `api-mode: cicd`);
+#   - an application id or name on the instance you point it at.
+
+on:
+  workflow_dispatch:
+    inputs:
+      endpoint:
+        description: Base URL of the Notploy instance, e.g. https://notploy.example.com
+        required: true
+        type: string
+      application-id:
+        description: Application id, appName or dashboard name to deploy
+        required: true
+        type: string
+      project:
+        description: Optional project id or name (CI/CD API only)
+        required: false
+        type: string
+      environment:
+        description: Optional environment id or name (CI/CD API only)
+        required: false
+        type: string
+      api-mode:
+        description: Which API surface to exercise
+        type: choice
+        options:
+          - auto
+          - cicd
+          - legacy
+        default: auto
+      wait:
+        description: Wait for the deployment to reach a final state
+        type: boolean
+        default: true
+      timeout:
+        description: Maximum time to wait, as a Go duration
+        type: string
+        default: 30m
+      cancel-on-timeout:
+        description: Cancel the deployment in Notploy when the wait gives up
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: integration
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy with the local action
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Run the action from this checkout
+        id: deploy
+        uses: ./
+        with:
+          endpoint: ${{ inputs.endpoint }}
+          api-key: ${{ secrets.NOTPLOY_API_KEY }}
+          application-id: ${{ inputs.application-id }}
+          project: ${{ inputs.project }}
+          environment: ${{ inputs.environment }}
+          api-mode: ${{ inputs.api-mode }}
+          wait: ${{ inputs.wait }}
+          timeout: ${{ inputs.timeout }}
+          cancel-on-timeout: ${{ inputs.cancel-on-timeout }}
+          github-token: ${{ github.token }}
+
+      - name: Report the outputs
+        env:
+          DEPLOYMENT_ID: ${{ steps.deploy.outputs.deployment-id }}
+          DEPLOYMENT_STATUS: ${{ steps.deploy.outputs.deployment-status }}
+          DEPLOYMENT_URL: ${{ steps.deploy.outputs.deployment-url }}
+          DETAILS_URL: ${{ steps.deploy.outputs.deployment-details-url }}
+          LOGS_URL: ${{ steps.deploy.outputs.deployment-logs-url }}
+          DEPLOYMENT_ENVIRONMENT: ${{ steps.deploy.outputs.deployment-environment }}
+          IDEMPOTENT: ${{ steps.deploy.outputs.deployment-idempotent }}
+        run: |
+          {
+            echo "### Notploy integration run"
+            echo
+            echo "| output | value |"
+            echo "| --- | --- |"
+            printf '| deployment-id | %s |\n' "${DEPLOYMENT_ID}"
+            printf '| deployment-status | %s |\n' "${DEPLOYMENT_STATUS}"
+            printf '| deployment-url | %s |\n' "${DEPLOYMENT_URL}"
+            printf '| deployment-details-url | %s |\n' "${DETAILS_URL}"
+            printf '| deployment-logs-url | %s |\n' "${LOGS_URL}"
+            printf '| deployment-environment | %s |\n' "${DEPLOYMENT_ENVIRONMENT}"
+            printf '| deployment-idempotent | %s |\n' "${IDEMPOTENT}"
+          } >> "${GITHUB_STEP_SUMMARY}"

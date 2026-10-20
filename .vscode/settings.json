@@ -1,4 +1,7 @@
 {
     "codeQL.githubDatabase.download": "never",
-    "prisma.pinToPrisma6": true
+    "go.testFlags": ["-count=1"],
+    "files.trimTrailingWhitespace": true,
+    "editor.insertSpaces": true,
+    "editor.tabSize": 4
 }

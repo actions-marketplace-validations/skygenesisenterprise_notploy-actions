@@ -1,7 +1,7 @@
 # The action is a self-contained Go binary. Building it inside a container keeps
 # the runtime reproducible and means the GitHub runner needs neither Go nor
 # Node.js to run it.
-FROM golang:1.24-alpine AS build
+FROM golang:1.26-alpine AS build
 
 WORKDIR /src
 
