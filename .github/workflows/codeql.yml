@@ -2,9 +2,9 @@ name: CodeQL
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   pull_request:
-    branches: [master]
+    branches: [main]
   schedule:
     # Weekly, Monday 03:23 UTC. Off the hour on purpose: the top of the hour is
     # when every other scheduled workflow on GitHub runs.
@@ -35,13 +35,6 @@ jobs:
           # GitHub Actions workflows.
           - language: actions
             build-mode: none
-          # TypeScript/JS: the workspace is compiled ahead of the analysis and
-          # the sources are handed to CodeQL directly. `none` build mode is
-          # correct here — there is no single build command for the monorepo and
-          # an autobuild attempt is slow and unreliable. Scoped to the packages
-          # that contain TypeScript.
-          - language: javascript-typescript
-            build-mode: none
           # Go: a single module, so autobuild works.
           - language: go
             build-mode: autobuild
@@ -50,20 +43,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install dependencies
-        if: matrix.language == 'javascript-typescript'
-        run: |
-          corepack enable
-          corepack prepare pnpm@10.22.0 --activate
-          pnpm install --frozen-lockfile
-
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
-          # Dependency vendoring is not used: the TypeScript analysis reads
-          # sources directly and the Go module downloads its own dependencies.
+          # Dependency vendoring is not used: the Go module downloads its own
+          # dependencies and the Actions analysis reads workflow files.
           queries: security-extended,security-and-quality
 
       - name: Perform CodeQL analysis

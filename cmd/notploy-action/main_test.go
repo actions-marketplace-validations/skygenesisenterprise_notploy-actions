@@ -16,10 +16,14 @@ import (
 
 const (
 	testAPIKey    = "npk_end_to_end_key"
+	testGitHubTok = "ghp_test_status_token"
 	testAppID     = "application-1"
 	testOldID     = "deployment-1"
 	testNewID     = "deployment-2"
 	testPublicURL = "https://my-app.example.com"
+	testDashboard = "https://notploy.example.com/dashboard/applications/application-1"
+	testLogText   = "step 1/3: cloning\nstep 2/3: building\nstep 3/3: build failed"
+	testError     = "build failed: Dockerfile not found"
 )
 
 // binary builds the action once per test run and returns its path.
@@ -38,14 +42,22 @@ var binary = sync.OnceValues(func() (string, error) {
 
 // scenario scripts a fake Notploy instance for one action run.
 type scenario struct {
-	// statuses are the statuses reported for the deployment this run creates,
-	// in order. The last one is repeated, so the wait always terminates.
+	// statuses are the statuses reported after the trigger, in order. The last
+	// one is repeated, so the wait always terminates.
 	statuses []string
-	// inputKeySuffix lets a test use the other spelling of an input name.
+	// apiMode is the value of the `api-mode` input; empty means `auto`.
+	apiMode string
+	// cicdUnavailable makes the instance answer the CI/CD API with the 403 a
+	// non-CI/CD token gets, which is what the `auto` fallback reacts to.
+	cicdUnavailable bool
+	// underscoredAPIKey uses the other spelling of an input name.
 	underscoredAPIKey bool
+	// githubToken provides the `github-token` input, which turns on the
+	// commit status publication.
+	githubToken bool
 }
 
-func TestActionSucceedsAndPublishesItsResult(t *testing.T) {
+func TestActionSucceedsViaTheCicdAPI(t *testing.T) {
 	result := runAction(t, scenario{statuses: []string{"running", "done"}})
 
 	if result.exitCode != 0 {
@@ -66,23 +78,86 @@ func TestActionSucceedsAndPublishesItsResult(t *testing.T) {
 	if result.outputs["deployment-url"] != testPublicURL {
 		t.Errorf("deployment-url = %q", result.outputs["deployment-url"])
 	}
+	if result.outputs["deployment-details-url"] != testDashboard {
+		t.Errorf("deployment-details-url = %q", result.outputs["deployment-details-url"])
+	}
+	if !strings.Contains(result.outputs["deployment-logs-url"], "/api/cicd/deployments/"+testNewID+"/logs") {
+		t.Errorf("deployment-logs-url = %q", result.outputs["deployment-logs-url"])
+	}
+	if result.outputs["deployment-environment"] != "production" {
+		t.Errorf("deployment-environment = %q", result.outputs["deployment-environment"])
+	}
+	if result.outputs["deployment-idempotent"] != "false" {
+		t.Errorf("deployment-idempotent = %q, want false for a new deployment", result.outputs["deployment-idempotent"])
+	}
 	if !strings.Contains(result.summary, "## Notploy deployment") {
 		t.Errorf("summary is missing its title:\n%s", result.summary)
 	}
 	if !strings.Contains(result.summary, testNewID) {
 		t.Errorf("summary is missing the deployment id:\n%s", result.summary)
 	}
-	if result.stdout == "" {
-		t.Error("the action printed nothing")
+	if !strings.Contains(result.summary, "CI/CD API") {
+		t.Errorf("summary does not name the API surface:\n%s", result.summary)
+	}
+	if !result.instance.cicdDeployed || result.instance.legacyDeployed {
+		t.Errorf("cicdDeployed = %v, legacyDeployed = %v, want only the CI/CD API",
+			result.instance.cicdDeployed, result.instance.legacyDeployed)
 	}
 	// The summary is what reviewers read: secrets must never reach it.
-	if strings.Contains(result.summary, testAPIKey) {
-		t.Fatalf("the summary leaked the API key:\n%s", result.summary)
+	if strings.Contains(result.summary, testAPIKey) || strings.Contains(result.summary, testGitHubTok) {
+		t.Fatalf("the summary leaked a secret:\n%s", result.summary)
+	}
+}
+
+func TestActionFallsBackWithoutACicdToken(t *testing.T) {
+	result := runAction(t, scenario{
+		statuses:        []string{"running", "done"},
+		cicdUnavailable: true,
+	})
+
+	if result.exitCode != 0 {
+		t.Fatalf("exit code = %d, want 0\nstdout:\n%s", result.exitCode, result.stdout)
+	}
+	if !result.instance.legacyDeployed {
+		t.Fatalf("the classic endpoints were not used:\n%s", result.stdout)
+	}
+	if result.outputs["deployment-status"] != "done" {
+		t.Errorf("deployment-status = %q", result.outputs["deployment-status"])
+	}
+	// The classic API has no idempotency: an empty value says "not applicable".
+	if result.outputs["deployment-idempotent"] != "" {
+		t.Errorf("deployment-idempotent = %q, want empty on the classic endpoints", result.outputs["deployment-idempotent"])
+	}
+	if !strings.Contains(result.summary, "classic API") {
+		t.Errorf("summary does not name the API surface:\n%s", result.summary)
+	}
+	if result.outputs["deployment-url"] != testPublicURL {
+		t.Errorf("deployment-url = %q", result.outputs["deployment-url"])
+	}
+}
+
+func TestActionUsesOnlyTheClassicAPIWhenAskedTo(t *testing.T) {
+	result := runAction(t, scenario{
+		statuses: []string{"running", "done"},
+		apiMode:  "legacy",
+	})
+
+	if result.exitCode != 0 {
+		t.Fatalf("exit code = %d, want 0\nstdout:\n%s", result.exitCode, result.stdout)
+	}
+	if result.instance.cicdDeployed {
+		t.Fatal("the CI/CD API was used despite api-mode: legacy")
+	}
+	if !result.instance.legacyDeployed {
+		t.Fatal("the classic endpoints were not used")
+	}
+	if !strings.Contains(result.stdout, "classic API") {
+		t.Errorf("stdout does not report the API mode:\n%s", result.stdout)
 	}
 }
 
 func TestActionFailsWhenTheDeploymentFails(t *testing.T) {
-	result := runAction(t, scenario{statuses: []string{"running", "error"}})
+	result := runAction(t, scenario{statuses: []string{"error"}})
 
 	if result.exitCode == 0 {
 		t.Fatalf("exit code = 0, want a failure\nstdout:\n%s", result.stdout)
@@ -97,6 +172,22 @@ func TestActionFailsWhenTheDeploymentFails(t *testing.T) {
 	// link to the failed deployment.
 	if result.outputs["deployment-id"] != testNewID {
 		t.Errorf("deployment-id = %q", result.outputs["deployment-id"])
+	}
+	// The failure is only actionable with the deployment's own message and log.
+	if !strings.Contains(result.stdout, testError) {
+		t.Errorf("stdout does not report the deployment error:\n%s", result.stdout)
+	}
+	if !strings.Contains(result.stdout, "step 3/3: build failed") {
+		t.Errorf("stdout does not contain the log tail:\n%s", result.stdout)
+	}
+	if !strings.Contains(result.summary, testError) {
+		t.Errorf("summary does not contain the deployment error:\n%s", result.summary)
+	}
+	if !strings.Contains(result.summary, "step 3/3: build failed") {
+		t.Errorf("summary does not contain the log excerpt:\n%s", result.summary)
+	}
+	if !result.instance.cicdLogsRead {
+		t.Error("the CI/CD logs endpoint was not used")
 	}
 }
 
@@ -114,11 +205,45 @@ func TestActionReadsUnderscoredInputNames(t *testing.T) {
 	}
 }
 
+func TestActionPublishesCommitStatuses(t *testing.T) {
+	result := runAction(t, scenario{
+		statuses:    []string{"running", "done"},
+		githubToken: true,
+	})
+
+	if result.exitCode != 0 {
+		t.Fatalf("exit code = %d, want 0\nstdout:\n%s", result.exitCode, result.stdout)
+	}
+	states := result.instance.statusStates
+	if len(states) < 2 {
+		t.Fatalf("published commit statuses = %v, want at least a pending and a final one", states)
+	}
+	if states[len(states)-1] != "success" {
+		t.Errorf("last commit status = %q, want success (%v)", states[len(states)-1], states)
+	}
+	for _, state := range states[:len(states)-1] {
+		if state != "pending" {
+			t.Errorf("intermediate commit status = %q, want pending (%v)", state, states)
+		}
+	}
+	contexts := map[string]bool{}
+	for _, name := range result.instance.statusContexts {
+		contexts[name] = true
+	}
+	if len(contexts) != 1 {
+		t.Fatalf("commit status contexts = %v, want exactly one", result.instance.statusContexts)
+	}
+	if !strings.HasPrefix(result.instance.statusContexts[0], "notploy/") {
+		t.Errorf("commit status context = %q, want the notploy/ prefix", result.instance.statusContexts[0])
+	}
+}
+
 type runResult struct {
 	exitCode int
 	stdout   string
 	outputs  map[string]string
 	summary  string
+	instance *fakeInstance
 }
 
 func runAction(t *testing.T, scenario scenario) runResult {
@@ -158,15 +283,24 @@ func runAction(t *testing.T, scenario scenario) runResult {
 		"GITHUB_EVENT_NAME=push",
 		"GITHUB_RUN_ID=123456",
 		"GITHUB_RUN_NUMBER=42",
+		"GITHUB_RUN_ATTEMPT=1",
 		"GITHUB_SERVER_URL=https://github.com",
 		"GITHUB_WORKFLOW=Deploy",
+		"GITHUB_API_URL=" + instance.URL,
+	}
+	if scenario.apiMode != "" {
+		command.Env = append(command.Env, "INPUT_API-MODE="+scenario.apiMode)
+	}
+	if scenario.githubToken {
+		command.Env = append(command.Env, "INPUT_GITHUB-TOKEN="+testGitHubTok)
 	}
 	output, err := command.CombinedOutput()
 
 	result := runResult{
-		stdout:  string(output),
-		outputs: parseOutputs(t, outputPath),
-		summary: readIfPresent(t, summaryPath),
+		stdout:   string(output),
+		outputs:  parseOutputs(t, outputPath),
+		summary:  readIfPresent(t, summaryPath),
+		instance: instance,
 	}
 	if err == nil {
 		return result
@@ -180,17 +314,128 @@ func runAction(t *testing.T, scenario scenario) runResult {
 	return result
 }
 
-// newFakeInstance serves the three Notploy endpoints the action uses.
-func newFakeInstance(t *testing.T, scenario scenario) *httptest.Server {
+// fakeInstance is a Notploy that speaks both API surfaces, plus the GitHub
+// commit status endpoint.
+type fakeInstance struct {
+	URL string
+
+	mutex sync.Mutex
+
+	// Classic endpoints.
+	legacyDeployed bool
+	listCalls      int
+	deployments    []map[string]any
+
+	// CI/CD API.
+	cicdDeployed    bool
+	cicdStatusCalls int
+	cicdLogsRead    bool
+	cicdRequest     map[string]any
+
+	// GitHub commit statuses.
+	statusStates   []string
+	statusContexts []string
+}
+
+func newFakeInstance(t *testing.T, sc scenario) *fakeInstance {
 	t.Helper()
 
-	var (
-		mutex       sync.Mutex
-		listCalls   int
-		deployments []map[string]any
-	)
-
+	instance := &fakeInstance{}
 	mux := http.NewServeMux()
+
+	// --- CI/CD API -----------------------------------------------------------
+
+	mux.HandleFunc("/api/cicd/deploy", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if sc.cicdUnavailable {
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"message": "This API key is not a CI/CD token. Create one from the project's CI/CD page.",
+				"code":    "FORBIDDEN",
+			})
+			return
+		}
+		if r.Header.Get("x-api-key") != testAPIKey {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{
+				"message": "This endpoint requires a Notploy CI/CD API token. Send it as `x-api-key`.",
+				"code":    "UNAUTHORIZED",
+			})
+			return
+		}
+
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+
+		instance.mutex.Lock()
+		defer instance.mutex.Unlock()
+		instance.cicdDeployed = true
+		instance.cicdRequest = body
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"deploymentId":    testNewID,
+			"status":          "running",
+			"queued":          true,
+			"title":           body["title"],
+			"description":     body["description"],
+			"applicationId":   testAppID,
+			"applicationName": "my-app",
+			"environmentName": "production",
+			"deploymentUrl":   testDashboard,
+			"environmentUrl":  testPublicURL,
+			"idempotent":      false,
+			"message":         "deployment queued",
+		})
+	})
+
+	mux.HandleFunc("/api/cicd/deployments/", func(w http.ResponseWriter, r *http.Request) {
+		rest := strings.TrimPrefix(r.URL.Path, "/api/cicd/deployments/")
+		id, action, _ := strings.Cut(rest, "/")
+
+		instance.mutex.Lock()
+		defer instance.mutex.Unlock()
+
+		switch {
+		case action == "logs" && r.Method == http.MethodGet:
+			instance.cicdLogsRead = true
+			writeJSON(w, http.StatusOK, map[string]any{
+				"deploymentId": id,
+				"status":       "error",
+				"logs":         testLogText,
+				"lineCount":    3,
+				"tail":         100,
+				"truncated":    false,
+			})
+		case action == "cancel" && r.Method == http.MethodPost:
+			writeJSON(w, http.StatusOK, map[string]any{})
+		case action == "":
+			status := sc.statuses[len(sc.statuses)-1]
+			if instance.cicdStatusCalls < len(sc.statuses) {
+				status = sc.statuses[instance.cicdStatusCalls]
+			}
+			instance.cicdStatusCalls++
+
+			view := map[string]any{
+				"deploymentId":    id,
+				"status":          status,
+				"applicationId":   testAppID,
+				"applicationName": "my-app",
+				"environmentName": "production",
+				"deploymentUrl":   testDashboard,
+				"environmentUrl":  testPublicURL,
+				"title":           "GitHub Actions deployment",
+			}
+			if status == "error" {
+				view["errorMessage"] = testError
+			}
+			writeJSON(w, http.StatusOK, view)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+
+	// --- Classic endpoints ---------------------------------------------------
 
 	mux.HandleFunc("/api/application.deploy", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -205,16 +450,26 @@ func newFakeInstance(t *testing.T, scenario scenario) *httptest.Server {
 			return
 		}
 
-		mutex.Lock()
-		defer mutex.Unlock()
-		// The deployment row appears only after the trigger.
-		deployments = append([]map[string]any{{
+		var body struct {
+			Title       string `json:"title"`
+			Description string `json:"description"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+
+		instance.mutex.Lock()
+		defer instance.mutex.Unlock()
+		instance.legacyDeployed = true
+		// The deployment row appears only after the trigger, carrying the title
+		// and description verbatim — which is exactly how the action
+		// recognises its own deployment.
+		instance.deployments = append([]map[string]any{{
 			"deploymentId":  testNewID,
-			"title":         "GitHub Actions: Deploy #42",
+			"title":         body.Title,
+			"description":   body.Description,
 			"status":        "running",
 			"applicationId": testAppID,
 			"createdAt":     "2026-09-28T12:00:00.000Z",
-		}}, deployments...)
+		}}, instance.deployments...)
 		writeJSON(w, http.StatusOK, map[string]any{})
 	})
 
@@ -224,18 +479,18 @@ func newFakeInstance(t *testing.T, scenario scenario) *httptest.Server {
 			return
 		}
 
-		mutex.Lock()
-		defer mutex.Unlock()
+		instance.mutex.Lock()
+		defer instance.mutex.Unlock()
 
-		call := listCalls
-		listCalls++
+		call := instance.listCalls
+		instance.listCalls++
 
-		for _, deployment := range deployments {
+		for _, deployment := range instance.deployments {
 			if deployment["deploymentId"] == testNewID {
-				deployment["status"] = statusAt(scenario.statuses, call-1)
+				deployment["status"] = statusAt(sc.statuses, call-1)
 			}
 		}
-		writeJSON(w, http.StatusOK, deployments)
+		writeJSON(w, http.StatusOK, instance.deployments)
 	})
 
 	mux.HandleFunc("/api/application.one", func(w http.ResponseWriter, r *http.Request) {
@@ -248,8 +503,30 @@ func newFakeInstance(t *testing.T, scenario scenario) *httptest.Server {
 		})
 	})
 
+	mux.HandleFunc("/api/deployment.readLogs", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte(testLogText))
+	})
+
+	// --- GitHub commit statuses ---------------------------------------------
+
+	mux.HandleFunc("/repos/", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			State   string `json:"state"`
+			Context string `json:"context"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+
+		instance.mutex.Lock()
+		defer instance.mutex.Unlock()
+		instance.statusStates = append(instance.statusStates, body.State)
+		instance.statusContexts = append(instance.statusContexts, body.Context)
+
+		writeJSON(w, http.StatusCreated, body)
+	})
+
 	// The historical deployment the snapshot has to ignore.
-	deployments = []map[string]any{{
+	instance.deployments = []map[string]any{{
 		"deploymentId":  testOldID,
 		"title":         "previous",
 		"status":        "done",
@@ -259,7 +536,8 @@ func newFakeInstance(t *testing.T, scenario scenario) *httptest.Server {
 
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
-	return server
+	instance.URL = server.URL
+	return instance
 }
 
 // statusAt indexes the scripted statuses, ignoring the pre-trigger snapshot

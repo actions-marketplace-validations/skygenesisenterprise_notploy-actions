@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Go
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l cmd internal)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::These files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./... -count=1
+
+      - name: Lint
+        run: go run github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8 run ./...
+
+  action:
+    name: Action metadata and workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Validate action.yml
+        # `npx @action-validator/cli` is the CLI of @action-validator/core; the
+        # unrelated `action-validator` package on npm is a different project.
+        run: npx -y @action-validator/cli@0.6.0 action.yml
+
+      - name: Lint workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+
+  container:
+    name: Container image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Build the action image
+        run: docker build --build-arg VERSION=ci -t notploy-action:ci .
+
+      - name: Smoke test the binary
+        # Running it without inputs must fail with a readable configuration
+        # error, not a crash: that is what a misconfigured workflow sees.
+        run: |
+          set +e
+          output="$(docker run --rm --entrypoint /usr/local/bin/notploy-action notploy-action:ci 2>&1)"
+          code=$?
+          set -e
+          echo "$output"
+          if [ "$code" -ne 1 ]; then
+            echo "::error::expected exit code 1 for a run without inputs, got $code"
+            exit 1
+          fi
+          case "$output" in
+            *"missing required input"*) ;;
+            *)
+              echo "::error::the binary did not report the missing inputs"
+              exit 1
+              ;;
+          esac

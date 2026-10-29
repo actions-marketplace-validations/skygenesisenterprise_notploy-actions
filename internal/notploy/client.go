@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -33,6 +34,10 @@ const (
 
 	// transientAttempts is the number of tries for an idempotent request.
 	transientAttempts = 3
+	// retryBaseDelay and retryMaxDelay bound the exponential backoff between
+	// two tries of an idempotent request.
+	retryBaseDelay = 500 * time.Millisecond
+	retryMaxDelay  = 5 * time.Second
 )
 
 // Options configures a Client.
@@ -123,6 +128,9 @@ func normalizeEndpoint(endpoint string) (*url.URL, error) {
 //
 // Notploy answers with an empty 200 body: the deployment id is not returned.
 // Callers discover the created deployment through ListDeployments.
+//
+// Never retried: this endpoint has no idempotency contract, so a duplicate
+// trigger would start a second deployment.
 func (c *Client) TriggerDeployment(ctx context.Context, applicationID, title, description string) error {
 	body := deployRequest{ApplicationID: applicationID}
 	if title != "" {
@@ -132,8 +140,7 @@ func (c *Client) TriggerDeployment(ctx context.Context, applicationID, title, de
 		body.Description = description
 	}
 
-	// Never retried: a duplicate trigger would start a second deployment.
-	return c.do(ctx, http.MethodPost, "application.deploy", nil, body, nil)
+	return c.do(ctx, false, http.MethodPost, "application.deploy", nil, body, nil)
 }
 
 // ListDeployments returns the deployments of an application, newest first
@@ -142,7 +149,7 @@ func (c *Client) ListDeployments(ctx context.Context, applicationID string) ([]D
 	query := url.Values{"applicationId": {applicationID}}
 
 	var deployments []Deployment
-	if err := c.do(ctx, http.MethodGet, "deployment.all", query, nil, &deployments); err != nil {
+	if err := c.do(ctx, true, http.MethodGet, "deployment.all", query, nil, &deployments); err != nil {
 		return nil, err
 	}
 	if deployments == nil {
@@ -151,13 +158,37 @@ func (c *Client) ListDeployments(ctx context.Context, applicationID string) ([]D
 	return deployments, nil
 }
 
+// ReadDeploymentLogs returns the last lines of a deployment's log
+// (`GET /api/deployment.readLogs?deploymentId=...&tail=...`).
+//
+// It is the legacy counterpart of the CI/CD logs endpoint, used when the API
+// key is not a CI/CD token.
+func (c *Client) ReadDeploymentLogs(ctx context.Context, deploymentID string, tail int) (string, error) {
+	if tail <= 0 {
+		tail = 100
+	}
+	if tail > legacyLogsTail {
+		tail = legacyLogsTail
+	}
+	query := url.Values{
+		"deploymentId": {deploymentID},
+		"tail":         {strconv.Itoa(tail)},
+	}
+
+	var logs string
+	if err := c.do(ctx, true, http.MethodGet, "deployment.readLogs", query, nil, &logs); err != nil {
+		return "", err
+	}
+	return logs, nil
+}
+
 // GetApplication returns one application and its domains
 // (`GET /api/application.one?applicationId=...`).
 func (c *Client) GetApplication(ctx context.Context, applicationID string) (*Application, error) {
 	query := url.Values{"applicationId": {applicationID}}
 
 	var application Application
-	if err := c.do(ctx, http.MethodGet, "application.one", query, nil, &application); err != nil {
+	if err := c.do(ctx, true, http.MethodGet, "application.one", query, nil, &application); err != nil {
 		return nil, err
 	}
 	return &application, nil
@@ -169,17 +200,19 @@ type deployRequest struct {
 	Description   string `json:"description,omitempty"`
 }
 
-// do performs a request, retrying idempotent calls on transient failures.
-func (c *Client) do(ctx context.Context, method, operation string, query url.Values, requestBody, responseBody any) error {
+// do performs a request. It is retried only when retry is set, which the
+// callers derive from the method's idempotency: GETs and CI/CD deploys carrying
+// an idempotency key are safe to repeat, everything else is not.
+func (c *Client) do(ctx context.Context, retry bool, method, operation string, query url.Values, requestBody, responseBody any) error {
 	attempts := 1
-	if method == http.MethodGet {
+	if retry {
 		attempts = transientAttempts
 	}
 
 	var lastErr error
 	for attempt := 1; attempt <= attempts; attempt++ {
 		if attempt > 1 {
-			if err := sleep(ctx, retryDelay(attempt)); err != nil {
+			if err := sleep(ctx, c.retryDelay(attempt, lastErr)); err != nil {
 				// The context expired while backing off. The failure that caused
 				// the backoff is more informative than the cancelled timer, so it
 				// is the one reported; callers that care about cancellation still
@@ -217,8 +250,28 @@ func isTransient(err error) bool {
 	return errors.As(err, &netErr)
 }
 
-func retryDelay(attempt int) time.Duration {
-	return time.Duration(attempt-1) * 500 * time.Millisecond
+// retryDelay returns how long to wait before the given attempt.
+//
+// It grows exponentially from retryBaseDelay so a struggling instance is not
+// hammered, honours a `Retry-After` hint when the instance sent one, and is
+// always capped by retryMaxDelay: the action must never sit in a backoff loop
+// for longer than the bounded number of attempts allows.
+func (c *Client) retryDelay(attempt int, lastErr error) time.Duration {
+	delay := retryMaxDelay
+	if attempt >= 2 {
+		if computed := time.Duration(1<<uint(attempt-2)) * retryBaseDelay; computed > 0 && computed < delay {
+			delay = computed
+		}
+	}
+
+	var apiErr *APIError
+	if errors.As(lastErr, &apiErr) && apiErr.RetryAfter > delay {
+		delay = apiErr.RetryAfter
+	}
+	if delay > retryMaxDelay {
+		delay = retryMaxDelay
+	}
+	return delay
 }
 
 func sleep(ctx context.Context, delay time.Duration) error {
@@ -299,6 +352,12 @@ func (c *Client) errorFromResponse(operation string, response *http.Response) er
 	body, _ := io.ReadAll(io.LimitReader(response.Body, maxErrorBodyBytes))
 
 	apiErr := &APIError{Operation: operation, StatusCode: response.StatusCode}
+	// A `Retry-After` in seconds is a request to slow down; it is read so the
+	// backoff respects it, but the value is bounded so a hostile header cannot
+	// stall the workflow.
+	if seconds, err := strconv.Atoi(strings.TrimSpace(response.Header.Get("Retry-After"))); err == nil && seconds > 0 {
+		apiErr.RetryAfter = time.Duration(min(seconds, 60)) * time.Second
+	}
 
 	var parsed errorResponse
 	if err := json.Unmarshal(body, &parsed); err == nil {
